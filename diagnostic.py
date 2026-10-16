@@ -1,25 +1,25 @@
-
 import streamlit as st
 import pandas as pd
 
-
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import StratifiedGroupKFold, cross_val_score
 from pathlib import Path
-from sklearn.model_selection import train_test_split
-from sklearn.tree import DecisionTreeClassifier
+from scipy.stats import kruskal
+from statsmodels.stats.multitest import multipletests
+
 
 st.title("Diagnostic Analysis")
 
 st.write(
-    "Which vital signs most strongly predict maternal risk?"
+    "Do physiological measurements differ across low-, "
+    "mid-, and high-risk groups, and which measurements "
+    "show the largest group differences?"
 )
 
 # Load data
-data_path = Path(__file__).parent / "Maternal Health Risk Data Set.csv"
+data_path = (
+    Path(__file__).parent / "Maternal Health Risk Data Set.csv"
+)
 df = pd.read_csv(data_path)
 
-# Select physiological features
 FEATURES = [
     "SystolicBP",
     "DiastolicBP",
@@ -28,367 +28,260 @@ FEATURES = [
     "HeartRate"
 ]
 
-X = df[FEATURES]
-y = df["RiskLevel"]
+RISK_ORDER = [
+    "low risk",
+    "mid risk",
+    "high risk"
+]
 
-# Split data
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
+
+def analyse_risk_groups(data):
+    results = []
+    summaries = []
+
+    for variable in FEATURES:
+        samples = [
+            data.loc[
+                data["RiskLevel"] == risk, variable
+            ].dropna()
+            for risk in RISK_ORDER
+        ]
+
+        if any(len(sample) < 5 for sample in samples):
+            raise ValueError(
+                f"Insufficient observations for {variable}."
+            )
+
+        H, p = kruskal(*samples)
+
+        n = sum(len(sample) for sample in samples)
+        k = len(samples)
+
+        # Kruskal–Wallis effect-size estimate:
+        # eta-squared based on H = (H - k + 1) / (n - k)
+        eta_squared_H = max(
+            0.0, (H - k + 1) / (n - k)
+        )
+
+        results.append({
+            "Variable": variable,
+            "H statistic": H,
+            "p-value": p,
+            "Effect size (eta²_H)": eta_squared_H
+        })
+
+        for risk, sample in zip(RISK_ORDER, samples):
+            summaries.append({
+                "Variable": variable,
+                "Risk group": risk,
+                "n": len(sample),
+                "Median": sample.median(),
+                "Q1": sample.quantile(0.25),
+                "Q3": sample.quantile(0.75)
+            })
+
+    results = pd.DataFrame(results)
+
+    # Holm correction across the five KW tests
+    results["Holm-adjusted p"] = multipletests(
+        results["p-value"],
+        method="holm"
+    )[1]
+
+    results["Significant after correction"] = (
+        results["Holm-adjusted p"] < 0.05
+    )
+
+    results = results.sort_values(
+        "Effect size (eta²_H)",
+        ascending=False
+    )
+
+    return results, pd.DataFrame(summaries)
+
+
+st.header("Differences Across Maternal Risk Groups")
+
+original_tab, unique_tab = st.tabs([
+    "Original records",
+    "Without exact duplicates"
+])
+
+# Exact duplicates are assessed using all original columns,
+# consistent with the shared data preparation.
+datasets = [
+    (original_tab, df),
+    (unique_tab, df.drop_duplicates())
+]
+
+for tab, analysis_data in datasets:
+    with tab:
+        st.write(
+            "Number of records:",
+            len(analysis_data)
+        )
+
+        results, summaries = analyse_risk_groups(
+            analysis_data
+        )
+
+        st.subheader("Kruskal–Wallis results")
+
+        display_results = results.copy()
+
+        display_results["H statistic"] = (
+            display_results["H statistic"].round(2)
+        )
+
+        display_results["Effect size (eta²_H)"] = (
+            display_results["Effect size (eta²_H)"].round(3)
+        )
+
+        for column in ["p-value", "Holm-adjusted p"]:
+            display_results[column] = (
+                display_results[column].map(
+                    lambda value: f"{value:.3e}"
+                )
+            )
+
+        st.dataframe(
+            display_results,
+            hide_index=True,
+            use_container_width=True
+        )
+
+        st.subheader("Comparison of Effect Sizes")
+
+        st.write(
+            "Larger effect-size estimates indicate greater "
+            "separation between risk groups in the ranked "
+            "measurements. They do not establish clinical "
+            "importance or causation."
+        )
+
+        st.bar_chart(
+            results.set_index("Variable")[
+                "Effect size (eta²_H)"
+            ]
+        )
+
+        st.subheader("Group Medians and Quartiles")
+
+        st.dataframe(
+            summaries.round(2),
+            hide_index=True,
+            use_container_width=True
+        )
+
+st.caption(
+    "Significant Kruskal–Wallis results indicate differences "
+    "among risk groups but do not identify which pairs differ. "
+    "Patient independence cannot be verified because patient "
+    "IDs are unavailable. Removing exact duplicates does not "
+    "guarantee independent observations."
 )
 
-# Train decision tree
-model = DecisionTreeClassifier(
-    max_depth=4,
-    random_state=42
-)
+# Compare original and deduplicated results
+st.header("Effect Sizes Before and After Duplicate Removal")
 
-model.fit(X_train, y_train)
+original_results, _ = analyse_risk_groups(df)
+unique_results, _ = analyse_risk_groups(df.drop_duplicates())
 
-# Feature importance
-importance = pd.Series(
-    model.feature_importances_,
-    index=FEATURES
-)
+effect_column = "Effect size (eta²_H)"
 
-st.header("Feature Importance")
-
-st.bar_chart(
-    importance.sort_values()
-)
-
-# Age-group analysis
-st.header("Feature Importance by Age Group")
-
-age_groups = {
-    "Under 20": df[df["Age"] < 20],
-    "20-34": df[(df["Age"] >= 20) & (df["Age"] < 35)],
-    "35 and over": df[df["Age"] >= 35]
+variable_labels = {
+    "BS": "Blood glucose",
+    "SystolicBP": "Systolic blood pressure",
+    "DiastolicBP": "Diastolic blood pressure",
+    "HeartRate": "Heart rate",
+    "BodyTemp": "Body temperature"
 }
 
-for group_name, group_data in age_groups.items():
+variable_order = [
+    "BS",
+    "SystolicBP",
+    "DiastolicBP",
+    "HeartRate",
+    "BodyTemp"
+]
 
-    st.subheader(group_name)
-
-    st.write("Number of records:", len(group_data))
-
-    X_group = group_data[FEATURES]
-    y_group = group_data["RiskLevel"]
-
-    group_model = DecisionTreeClassifier(
-        max_depth=4,
-        random_state=42
-    )
-
-
-    # Cross-validation accuracy
-    cv_scores = cross_val_score(
-        group_model,
-        X_group,
-        y_group,
-        cv=5,
-        scoring="accuracy"
-    )
-
-    st.write(
-        "Cross-validation accuracy:",
-        f"{cv_scores.mean():.2%}"
-    )
-
-    group_model.fit(X_group, y_group)
-
-    group_importance = pd.Series(
-        group_model.feature_importances_,
-        index=FEATURES
-    )
-
-    st.bar_chart(
-        group_importance.sort_values()
-    )
-    
-# Risk distribution by age group
-st.header("Risk Distribution by Age Group")
-
-risk_table = pd.crosstab(
-    pd.cut(
-        df["Age"],
-        bins=[0, 19, 34, float("inf")],
-        labels=["Under 20", "20-34", "35 and over"]
-    ),
-    df["RiskLevel"]
+original_label = f"Original dataset (n = {len(df):,})"
+unique_label = (
+    f"Without duplicates (n = {len(df.drop_duplicates()):,})"
 )
 
-st.write("Number of records")
-st.dataframe(risk_table)
-
-st.write("Risk distribution (%)")
-
-risk_percent = risk_table.div(
-    risk_table.sum(axis=1),
-    axis=0
-) * 100
-
-st.dataframe(risk_percent.round(1))
-
-st.bar_chart(risk_percent)
-
-
-# Sensitivity analysis: duplicate rows
-st.header("Sensitivity Analysis: Duplicate Records")
-
-# Use the same training data for both models
-train_df = df.loc[X_train.index].copy()
-
-# Remove exact duplicates from the training data
-train_unique = train_df.drop_duplicates()
-
-st.write("Original training records:", len(train_df))
-
-st.write(
-    "Training records after removing exact duplicates:",
-    len(train_unique)
-)
-
-# Train a new model without duplicate records
-unique_model = DecisionTreeClassifier(
-    max_depth=4,
-    random_state=42
-)
-
-X_unique = train_unique[FEATURES]
-y_unique = train_unique["RiskLevel"]
-
-unique_model.fit(X_unique, y_unique)
-
-# Feature importance without duplicates
-importance_unique = pd.Series(
-    unique_model.feature_importances_,
-    index=FEATURES
-)
-
-# Compare with the original training model
 comparison = pd.DataFrame({
-    "Original": importance,
-    "Without duplicates": importance_unique
+    original_label: original_results.set_index("Variable")[
+        effect_column
+    ],
+    unique_label: unique_results.set_index("Variable")[
+        effect_column
+    ]
 })
 
-st.write("Feature importance comparison")
-
-st.dataframe(comparison.round(3))
-
-st.bar_chart(comparison)
-
-
-# Age-group sensitivity analysis
-st.header("Age-Group Sensitivity Analysis")
-
-st.write(
-    "Comparing feature importance before and after "
-    "removing exact duplicate records within each age group."
+comparison = comparison.loc[variable_order].rename(
+    index=variable_labels
 )
 
-for group_name, group_data in age_groups.items():
+comparison.index.name = "Variable name"
 
-    st.subheader(group_name)
+st.subheader("Effect-Size Comparison Table")
 
-    # Remove exact duplicate records
-    group_unique = group_data.drop_duplicates()
-
-    st.write(
-        "Original records:",
-        len(group_data)
-    )
-
-    st.write(
-        "Records without duplicates:",
-        len(group_unique)
-    )
-
-    # Model trained on original group data
-    original_model = DecisionTreeClassifier(
-        max_depth=4,
-        random_state=42
-    )
-
-    original_model.fit(
-        group_data[FEATURES],
-        group_data["RiskLevel"]
-    )
-
-    # Model trained on data without duplicates
-    unique_model = DecisionTreeClassifier(
-        max_depth=4,
-        random_state=42
-    )
-
-    unique_model.fit(
-        group_unique[FEATURES],
-        group_unique["RiskLevel"]
-    )
-
-    # Compare feature importance
-    original_importance = pd.Series(
-        original_model.feature_importances_,
-        index=FEATURES
-    )
-
-    unique_importance = pd.Series(
-        unique_model.feature_importances_,
-        index=FEATURES
-    )
-
-    comparison_group = pd.DataFrame({
-        "Original": original_importance,
-        "Without duplicates": unique_importance
-    })
-
-    st.write("Feature importance comparison")
-
-    st.dataframe(
-        comparison_group.round(3)
-    )
-
-
-# Group-aware cross-validation
-st.header("Group-Aware Cross-Validation")
-
-st.write(
-    "Evaluating model accuracy while keeping identical "
-    "feature combinations in the same validation group."
+st.dataframe(
+    comparison.style.format("{:.3f}"),
+    use_container_width=True
 )
 
-for group_name, group_data in age_groups.items():
+st.subheader("Effect-Size Comparison Chart")
 
-    st.subheader(group_name)
-
-    X_group = group_data[FEATURES]
-    y_group = group_data["RiskLevel"]
-
-    # Group records with identical physiological measurements
-    grouping_columns = ["Age"] + FEATURES
-
-    groups = pd.util.hash_pandas_object(
-        group_data[grouping_columns],
-        index=False
-    )
-
-    # Define a new decision tree
-    validation_model = DecisionTreeClassifier(
-        max_depth=4,
-        random_state=42
-    )
-
-    # Keep identical feature combinations in the same fold
-    cv = StratifiedGroupKFold(
-        n_splits=5,
-        shuffle=True,
-        random_state=42
-    )
-
-    scores = cross_val_score(
-        validation_model,
-        X_group,
-        y_group,
-        groups=groups,
-        cv=cv,
-        scoring="accuracy"
-    )
-
-    st.write(
-        "Group-aware CV accuracy:",
-        f"{scores.mean():.2%}"
-    )
-
-    st.write(
-        "Individual fold accuracies:",
-        [round(score, 3) for score in scores]
-    )
-
-
-# Baseline model comparison
-st.header("Decision Tree vs Baseline Model")
-
-st.write(
-    "Comparing the Decision Tree with a simple model "
-    "that always predicts the most frequent risk class."
+# Convert to long format for grouped bars
+chart_data = comparison.reset_index().melt(
+    id_vars="Variable name",
+    var_name="Dataset",
+    value_name="Effect size"
 )
 
-for group_name, group_data in age_groups.items():
+import altair as alt
 
-    st.subheader(group_name)
-
-    X_group = group_data[FEATURES]
-    y_group = group_data["RiskLevel"]
-
-    # Group identical measurements
-    grouping_columns = ["Age"] + FEATURES
-
-    groups = pd.util.hash_pandas_object(
-        group_data[grouping_columns],
-        index=False
+chart = (
+    alt.Chart(chart_data)
+    .mark_bar()
+    .encode(
+        x=alt.X(
+            "Variable name:N",
+            sort=list(variable_labels.values()),
+            title=None,
+            axis=alt.Axis(labelAngle=-25, labelLimit=0)
+        ),
+        xOffset=alt.XOffset(
+            "Dataset:N",
+            sort=[original_label, unique_label]
+        ),
+        y=alt.Y(
+            "Effect size:Q",
+            title="Effect size (η²_H)",
+            scale=alt.Scale(domain=[0, 0.35])
+        ),
+        color=alt.Color(
+            "Dataset:N",
+            sort=[original_label, unique_label],
+            scale=alt.Scale(range=["#4472C4", "#ED7D31"]),
+            legend=alt.Legend(title=None, orient="bottom", columns=1, labelLimit=0)
+        ),
+        tooltip=[
+            "Physiological measurement:N",
+            "Dataset:N",
+            alt.Tooltip("Effect size:Q", format=".3f")
+        ]
     )
+    .properties(height=400)
+)
 
-    # Group-aware cross-validation
-    cv = StratifiedGroupKFold(
-        n_splits=5,
-        shuffle=True,
-        random_state=42
-    )
+st.altair_chart(chart, use_container_width=True)
 
-    tree_scores = []
-    baseline_scores = []
-
-    for train_idx, test_idx in cv.split(
-        X_group, y_group, groups
-    ):
-
-        X_train_fold = X_group.iloc[train_idx]
-        X_test_fold = X_group.iloc[test_idx]
-
-        y_train_fold = y_group.iloc[train_idx]
-        y_test_fold = y_group.iloc[test_idx]
-
-        # Decision Tree
-        tree = DecisionTreeClassifier(
-            max_depth=4,
-            random_state=42
-        )
-
-        tree.fit(X_train_fold, y_train_fold)
-
-        tree_prediction = tree.predict(X_test_fold)
-
-        tree_scores.append(
-            accuracy_score(
-                y_test_fold,
-                tree_prediction
-            )
-        )
-
-        # Baseline: most frequent class in training data
-        most_common = y_train_fold.mode()[0]
-
-        baseline_prediction = [
-            most_common
-        ] * len(y_test_fold)
-
-        baseline_scores.append(
-            accuracy_score(
-                y_test_fold,
-                baseline_prediction
-            )
-        )
-
-    # Display results
-    st.write(
-        "Decision Tree accuracy:",
-        f"{sum(tree_scores) / len(tree_scores):.2%}"
-    )
-
-    st.write(
-        "Baseline accuracy:",
-        f"{sum(baseline_scores) / len(baseline_scores):.2%}"
-    )
+st.caption(
+    "Larger η²_H estimates indicate greater separation "
+    "between risk groups in the ranked measurements. "
+    "The estimates do not establish causation or "
+    "clinical importance."
+)
